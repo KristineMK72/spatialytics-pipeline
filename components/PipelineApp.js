@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { downloadCsv, parseCsv, geocodeAddress } from "../lib/csv";
 
 const STAGES = ["Lead", "Qualified", "Proposal", "Won", "Lost"];
 const STORAGE_KEY = "spatialytics_pipeline_v1";
@@ -111,14 +112,34 @@ function money(n) {
   }).format(n || 0);
 }
 
+function num(v) {
+  if (v === "" || v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function esc(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&")
+    .replace(/</g, "<")
+    .replace(/>/g, ">");
+}
+
 export default function PipelineApp() {
   const [tab, setTab] = useState("today");
   const [data, setData] = useState(SEED);
   const [hydrated, setHydrated] = useState(false);
-  const [modal, setModal] = useState(null); // { type, payload }
+  const [modal, setModal] = useState(null);
+  const [toast, setToast] = useState("");
+  const [geoBusy, setGeoBusy] = useState(false);
   const mapRef = useRef(null);
   const mapInstance = useRef(null);
-  const markersRef = useRef([]);
+  const fileRef = useRef(null);
+
+  const showToast = (msg) => {
+    setToast(msg);
+    setTimeout(() => setToast(""), 2800);
+  };
 
   useEffect(() => {
     setData(loadState());
@@ -144,9 +165,15 @@ export default function PipelineApp() {
     const won = data.deals
       .filter((d) => d.stage === "Won")
       .reduce((s, d) => s + (Number(d.amount) || 0), 0);
-    const dueSoon = data.deals.filter((d) => d.followUp && d.followUp <= daysFromNow(3) && d.stage !== "Won" && d.stage !== "Lost").length;
+    const dueSoon = data.deals.filter(
+      (d) =>
+        d.followUp &&
+        d.followUp <= daysFromNow(3) &&
+        d.stage !== "Won" &&
+        d.stage !== "Lost"
+    ).length;
     const openJobs = data.jobs.filter((j) => j.status === "Open").length;
-    return { pipelineValue, won, dueSoon, openJobs, contacts: data.contacts.length };
+    return { pipelineValue, won, dueSoon, openJobs };
   }, [data]);
 
   const todayItems = useMemo(() => {
@@ -183,7 +210,7 @@ export default function PipelineApp() {
       const deals = [...prev.deals];
       if (form.id) {
         const i = deals.findIndex((d) => d.id === form.id);
-        if (i >= 0) deals[i] = { ...deals[i], ...form };
+        if (i >= 0) deals[i] = { ...deals[i], ...form, amount: Number(form.amount) || 0 };
       } else {
         deals.push({
           id: uid("d"),
@@ -198,30 +225,41 @@ export default function PipelineApp() {
       return { ...prev, deals };
     });
     setModal(null);
+    showToast("Deal saved");
   };
 
-  const saveContact = (form) => {
+  const saveContact = async (form, opts = {}) => {
+    let lat = num(form.lat);
+    let lon = num(form.lon);
+    if (opts.geocode && form.city && (lat == null || lon == null)) {
+      const g = await geocodeAddress(form.city);
+      if (g) {
+        lat = g.lat;
+        lon = g.lon;
+      }
+    }
     setData((prev) => {
       const contacts = [...prev.contacts];
+      const row = {
+        name: form.name,
+        contact: form.contact || "",
+        email: form.email || "",
+        phone: form.phone || "",
+        city: form.city || "",
+        lat,
+        lon,
+        notes: form.notes || "",
+      };
       if (form.id) {
         const i = contacts.findIndex((c) => c.id === form.id);
-        if (i >= 0) contacts[i] = { ...contacts[i], ...form, lat: num(form.lat), lon: num(form.lon) };
+        if (i >= 0) contacts[i] = { ...contacts[i], ...row };
       } else {
-        contacts.push({
-          id: uid("c"),
-          name: form.name,
-          contact: form.contact || "",
-          email: form.email || "",
-          phone: form.phone || "",
-          city: form.city || "",
-          lat: num(form.lat),
-          lon: num(form.lon),
-          notes: form.notes || "",
-        });
+        contacts.push({ id: uid("c"), ...row });
       }
       return { ...prev, contacts };
     });
     setModal(null);
+    showToast(opts.geocode ? "Contact saved + geocoded" : "Contact saved");
   };
 
   const saveJob = (form) => {
@@ -246,6 +284,7 @@ export default function PipelineApp() {
       return { ...prev, jobs };
     });
     setModal(null);
+    showToast("Job saved");
   };
 
   const moveDeal = (dealId, stage) => {
@@ -255,81 +294,152 @@ export default function PipelineApp() {
     }));
   };
 
-  const deleteDeal = (id) => {
-    setData((prev) => ({ ...prev, deals: prev.deals.filter((d) => d.id !== id) }));
-  };
-
-  const deleteContact = (id) => {
+  const deleteDeal = (id) => setData((prev) => ({ ...prev, deals: prev.deals.filter((d) => d.id !== id) }));
+  const deleteContact = (id) =>
     setData((prev) => ({
       ...prev,
       contacts: prev.contacts.filter((c) => c.id !== id),
       deals: prev.deals.filter((d) => d.contactId !== id),
       jobs: prev.jobs.filter((j) => j.contactId !== id),
     }));
-  };
-
-  const deleteJob = (id) => {
-    setData((prev) => ({ ...prev, jobs: prev.jobs.filter((j) => j.id !== id) }));
-  };
+  const deleteJob = (id) => setData((prev) => ({ ...prev, jobs: prev.jobs.filter((j) => j.id !== id) }));
 
   const resetSeed = () => {
     if (confirm("Reset to sample data?")) {
       setData(SEED);
       localStorage.setItem(STORAGE_KEY, JSON.stringify(SEED));
+      showToast("Sample data restored");
     }
   };
 
-  // Map
+  const exportContacts = () => {
+    const rows = [
+      ["name", "contact", "email", "phone", "city", "lat", "lon", "notes"],
+      ...data.contacts.map((c) => [c.name, c.contact, c.email, c.phone, c.city, c.lat, c.lon, c.notes]),
+    ];
+    downloadCsv("pipeline_contacts.csv", rows);
+    showToast("Contacts exported");
+  };
+
+  const exportDeals = () => {
+    const rows = [
+      ["title", "account", "stage", "amount", "followUp", "notes"],
+      ...data.deals.map((d) => [
+        d.title,
+        contactMap[d.contactId]?.name || "",
+        d.stage,
+        d.amount,
+        d.followUp,
+        d.notes,
+      ]),
+    ];
+    downloadCsv("pipeline_deals.csv", rows);
+    showToast("Deals exported");
+  };
+
+  const exportJobs = () => {
+    const rows = [
+      ["title", "account", "status", "due", "lat", "lon", "notes"],
+      ...data.jobs.map((j) => [
+        j.title,
+        contactMap[j.contactId]?.name || "",
+        j.status,
+        j.due,
+        j.lat,
+        j.lon,
+        j.notes,
+      ]),
+    ];
+    downloadCsv("pipeline_jobs.csv", rows);
+    showToast("Jobs exported");
+  };
+
+  const importContactsFile = async (file) => {
+    const text = await file.text();
+    const rows = parseCsv(text);
+    if (!rows.length) {
+      showToast("No rows found in CSV");
+      return;
+    }
+    const mapped = rows.map((r) => ({
+      id: uid("c"),
+      name: r.name || r.account || r.company || "Untitled",
+      contact: r.contact || r.person || r.primary || "",
+      email: r.email || "",
+      phone: r.phone || r.tel || "",
+      city: r.city || r.address || r.location || "",
+      lat: num(r.lat || r.latitude),
+      lon: num(r.lon || r.lng || r.longitude),
+      notes: r.notes || r.note || "",
+    }));
+    setData((prev) => ({ ...prev, contacts: [...prev.contacts, ...mapped] }));
+    showToast(`Imported ${mapped.length} contacts`);
+  };
+
+  const geocodeMissing = async () => {
+    const missing = data.contacts.filter((c) => c.city && (c.lat == null || c.lon == null));
+    if (!missing.length) {
+      showToast("All contacts with a city already have coordinates");
+      return;
+    }
+    setGeoBusy(true);
+    let done = 0;
+    const updates = {};
+    for (const c of missing) {
+      const g = await geocodeAddress(c.city);
+      if (g) {
+        updates[c.id] = { lat: g.lat, lon: g.lon };
+        done++;
+      }
+      await new Promise((r) => setTimeout(r, 1100)); // be kind to Nominatim
+    }
+    setData((prev) => ({
+      ...prev,
+      contacts: prev.contacts.map((c) => (updates[c.id] ? { ...c, ...updates[c.id] } : c)),
+    }));
+    setGeoBusy(false);
+    showToast(`Geocoded ${done} of ${missing.length} contacts`);
+  };
+
   useEffect(() => {
     if (tab !== "map" || typeof window === "undefined") return;
-
     let cancelled = false;
-
     async function init() {
       const L = (await import("leaflet")).default;
       if (cancelled || !mapRef.current) return;
-
       if (mapInstance.current) {
         mapInstance.current.remove();
         mapInstance.current = null;
       }
-
       const map = L.map(mapRef.current).setView([46.35, -94.2], 8);
       L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
         attribution: "&copy; OSM &copy; CARTO",
         maxZoom: 19,
       }).addTo(map);
-
-      markersRef.current = [];
       const bounds = [];
-
       data.contacts.forEach((c) => {
         if (c.lat == null || c.lon == null) return;
         const m = L.marker([c.lat, c.lon]).addTo(map);
         m.bindPopup(`<strong>${esc(c.name)}</strong><br/>${esc(c.city || "")}<br/>Account`);
-        markersRef.current.push(m);
         bounds.push([c.lat, c.lon]);
       });
-
       data.jobs
         .filter((j) => j.status === "Open" && j.lat != null && j.lon != null)
         .forEach((j) => {
-          const m = L.circleMarker([j.lat, j.lon], {
+          L.circleMarker([j.lat, j.lon], {
             radius: 9,
             color: "#a78bfa",
             fillColor: "#a78bfa",
             fillOpacity: 0.7,
-          }).addTo(map);
-          m.bindPopup(`<strong>${esc(j.title)}</strong><br/>Job · due ${esc(j.due || "—")}`);
-          markersRef.current.push(m);
+          })
+            .addTo(map)
+            .bindPopup(`<strong>${esc(j.title)}</strong><br/>Job · due ${esc(j.due || "—")}`);
           bounds.push([j.lat, j.lon]);
         });
-
       if (bounds.length) map.fitBounds(bounds, { padding: [40, 40], maxZoom: 11 });
       mapInstance.current = map;
       setTimeout(() => map.invalidateSize(), 100);
     }
-
     init();
     return () => {
       cancelled = true;
@@ -340,10 +450,7 @@ export default function PipelineApp() {
     };
   }, [tab, data.contacts, data.jobs]);
 
-  const onDragStart = (e, dealId) => {
-    e.dataTransfer.setData("dealId", dealId);
-  };
-
+  const onDragStart = (e, dealId) => e.dataTransfer.setData("dealId", dealId);
   const onDrop = (e, stage) => {
     e.preventDefault();
     const dealId = e.dataTransfer.getData("dealId");
@@ -379,11 +486,21 @@ export default function PipelineApp() {
           ))}
         </nav>
         <div className="sidebar-foot">
-          Data stays in this browser (localStorage).
-          <br />
-          <button type="button" className="btn btn-ghost btn-sm" style={{ marginTop: 8 }} onClick={resetSeed}>
-            Reset sample data
-          </button>
+          Data stays in this browser.
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 10 }}>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={exportContacts}>
+              Export contacts CSV
+            </button>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={exportDeals}>
+              Export deals CSV
+            </button>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={exportJobs}>
+              Export jobs CSV
+            </button>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={resetSeed}>
+              Reset sample data
+            </button>
+          </div>
         </div>
       </aside>
 
@@ -411,7 +528,7 @@ export default function PipelineApp() {
           <>
             <div className="topbar">
               <h2>Today</h2>
-              <div style={{ display: "flex", gap: 8 }}>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                 <button type="button" className="btn btn-ghost" onClick={() => setModal({ type: "deal" })}>
                   + Deal
                 </button>
@@ -433,7 +550,13 @@ export default function PipelineApp() {
                     <div style={{ fontWeight: 700, marginTop: 6 }}>{item.title}</div>
                     <div style={{ color: "var(--muted)", fontSize: "0.85rem" }}>{item.sub}</div>
                   </div>
-                  <div style={{ textAlign: "right", fontSize: "0.85rem", color: item.overdue ? "var(--red)" : "var(--muted)" }}>
+                  <div
+                    style={{
+                      textAlign: "right",
+                      fontSize: "0.85rem",
+                      color: item.overdue ? "var(--red)" : "var(--muted)",
+                    }}
+                  >
                     {item.overdue ? "Overdue · " : ""}
                     {item.when}
                   </div>
@@ -488,11 +611,7 @@ export default function PipelineApp() {
                             >
                               Edit
                             </button>
-                            <button
-                              type="button"
-                              className="btn btn-danger btn-sm"
-                              onClick={() => deleteDeal(d.id)}
-                            >
+                            <button type="button" className="btn btn-danger btn-sm" onClick={() => deleteDeal(d.id)}>
                               Del
                             </button>
                           </div>
@@ -510,10 +629,35 @@ export default function PipelineApp() {
           <>
             <div className="topbar">
               <h2>Contacts & accounts</h2>
-              <button type="button" className="btn btn-primary" onClick={() => setModal({ type: "contact" })}>
-                + Contact
-              </button>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <input
+                  ref={fileRef}
+                  type="file"
+                  accept=".csv,text/csv"
+                  style={{ display: "none" }}
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) importContactsFile(f);
+                    e.target.value = "";
+                  }}
+                />
+                <button type="button" className="btn btn-ghost" onClick={() => fileRef.current?.click()}>
+                  Import CSV
+                </button>
+                <button type="button" className="btn btn-ghost" onClick={exportContacts}>
+                  Export CSV
+                </button>
+                <button type="button" className="btn btn-ghost" disabled={geoBusy} onClick={geocodeMissing}>
+                  {geoBusy ? "Geocoding…" : "Geocode missing"}
+                </button>
+                <button type="button" className="btn btn-primary" onClick={() => setModal({ type: "contact" })}>
+                  + Contact
+                </button>
+              </div>
             </div>
+            <p style={{ color: "var(--muted)", fontSize: "0.85rem", marginTop: -8, marginBottom: 12 }}>
+              CSV headers: name, contact, email, phone, city, lat, lon, notes — city is enough to geocode.
+            </p>
             <div className="card table-wrap">
               <table className="data">
                 <thead>
@@ -521,6 +665,7 @@ export default function PipelineApp() {
                     <th>Account</th>
                     <th>Contact</th>
                     <th>City</th>
+                    <th>Map</th>
                     <th>Phone</th>
                     <th></th>
                   </tr>
@@ -536,6 +681,9 @@ export default function PipelineApp() {
                       </td>
                       <td>{c.contact}</td>
                       <td>{c.city}</td>
+                      <td style={{ fontSize: "0.8rem", color: c.lat != null ? "var(--green)" : "var(--muted)" }}>
+                        {c.lat != null ? "✓" : "—"}
+                      </td>
                       <td>{c.phone}</td>
                       <td style={{ whiteSpace: "nowrap" }}>
                         <button
@@ -545,11 +693,7 @@ export default function PipelineApp() {
                         >
                           Edit
                         </button>{" "}
-                        <button
-                          type="button"
-                          className="btn btn-danger btn-sm"
-                          onClick={() => deleteContact(c.id)}
-                        >
+                        <button type="button" className="btn btn-danger btn-sm" onClick={() => deleteContact(c.id)}>
                           Del
                         </button>
                       </td>
@@ -566,9 +710,14 @@ export default function PipelineApp() {
           <>
             <div className="topbar">
               <h2>Field jobs</h2>
-              <button type="button" className="btn btn-primary" onClick={() => setModal({ type: "job" })}>
-                + Job
-              </button>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button type="button" className="btn btn-ghost" onClick={exportJobs}>
+                  Export CSV
+                </button>
+                <button type="button" className="btn btn-primary" onClick={() => setModal({ type: "job" })}>
+                  + Job
+                </button>
+              </div>
             </div>
             <div className="card table-wrap">
               <table className="data">
@@ -603,11 +752,7 @@ export default function PipelineApp() {
                         >
                           Edit
                         </button>{" "}
-                        <button
-                          type="button"
-                          className="btn btn-danger btn-sm"
-                          onClick={() => deleteJob(j.id)}
-                        >
+                        <button type="button" className="btn btn-danger btn-sm" onClick={() => deleteJob(j.id)}>
                           Del
                         </button>
                       </td>
@@ -625,7 +770,7 @@ export default function PipelineApp() {
             <div className="topbar">
               <h2>Map</h2>
               <p style={{ margin: 0, color: "var(--muted)", fontSize: "0.9rem" }}>
-                Accounts (markers) · open jobs (purple)
+                Accounts · open jobs (purple) — geocode contacts to place them here
               </p>
             </div>
             <div id="map" ref={mapRef} />
@@ -644,43 +789,52 @@ export default function PipelineApp() {
           onSaveJob={saveJob}
         />
       )}
+
+      {toast && (
+        <div
+          style={{
+            position: "fixed",
+            bottom: 24,
+            left: "50%",
+            transform: "translateX(-50%)",
+            background: "#1e293b",
+            border: "1px solid var(--border)",
+            padding: "12px 18px",
+            borderRadius: 999,
+            zIndex: 200,
+            fontSize: "0.9rem",
+          }}
+        >
+          {toast}
+        </div>
+      )}
     </div>
   );
 }
 
-function num(v) {
-  if (v === "" || v == null) return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-
-function esc(s) {
-  return String(s ?? "")
-    .replace(/&/g, "&")
-    .replace(/</g, "<")
-    .replace(/>/g, ">");
-}
-
 function Modal({ type, payload, contacts, onClose, onSaveDeal, onSaveContact, onSaveJob }) {
   const [form, setForm] = useState(() => payload || defaultForm(type, contacts));
-
+  const [busy, setBusy] = useState(false);
   const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
 
-  const submit = (e) => {
+  const submit = async (e, geocode = false) => {
     e.preventDefault();
     if (type === "deal") onSaveDeal(form);
-    if (type === "contact") onSaveContact(form);
     if (type === "job") onSaveJob(form);
+    if (type === "contact") {
+      setBusy(true);
+      await onSaveContact(form, { geocode });
+      setBusy(false);
+    }
   };
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <h3>
-          {payload ? "Edit" : "New"}{" "}
-          {type === "deal" ? "deal" : type === "contact" ? "contact" : "job"}
+          {payload ? "Edit" : "New"} {type === "deal" ? "deal" : type === "contact" ? "contact" : "job"}
         </h3>
-        <form onSubmit={submit}>
+        <form onSubmit={(e) => submit(e, false)}>
           {type === "deal" && (
             <>
               <div className="field">
@@ -689,11 +843,7 @@ function Modal({ type, payload, contacts, onClose, onSaveDeal, onSaveContact, on
               </div>
               <div className="field">
                 <label>Account</label>
-                <select
-                  required
-                  value={form.contactId || ""}
-                  onChange={(e) => set("contactId", e.target.value)}
-                >
+                <select required value={form.contactId || ""} onChange={(e) => set("contactId", e.target.value)}>
                   <option value="">Select…</option>
                   {contacts.map((c) => (
                     <option key={c.id} value={c.id}>
@@ -714,19 +864,11 @@ function Modal({ type, payload, contacts, onClose, onSaveDeal, onSaveContact, on
               </div>
               <div className="field">
                 <label>Amount ($)</label>
-                <input
-                  type="number"
-                  value={form.amount ?? ""}
-                  onChange={(e) => set("amount", e.target.value)}
-                />
+                <input type="number" value={form.amount ?? ""} onChange={(e) => set("amount", e.target.value)} />
               </div>
               <div className="field">
                 <label>Follow-up date</label>
-                <input
-                  type="date"
-                  value={form.followUp || ""}
-                  onChange={(e) => set("followUp", e.target.value)}
-                />
+                <input type="date" value={form.followUp || ""} onChange={(e) => set("followUp", e.target.value)} />
               </div>
               <div className="field">
                 <label>Notes</label>
@@ -754,16 +896,20 @@ function Modal({ type, payload, contacts, onClose, onSaveDeal, onSaveContact, on
                 <input value={form.phone || ""} onChange={(e) => set("phone", e.target.value)} />
               </div>
               <div className="field">
-                <label>City</label>
-                <input value={form.city || ""} onChange={(e) => set("city", e.target.value)} />
+                <label>City / address</label>
+                <input
+                  value={form.city || ""}
+                  onChange={(e) => set("city", e.target.value)}
+                  placeholder="Brainerd, MN"
+                />
               </div>
               <div className="field">
-                <label>Lat</label>
-                <input value={form.lat ?? ""} onChange={(e) => set("lat", e.target.value)} placeholder="46.35" />
+                <label>Lat (optional)</label>
+                <input value={form.lat ?? ""} onChange={(e) => set("lat", e.target.value)} />
               </div>
               <div className="field">
-                <label>Lon</label>
-                <input value={form.lon ?? ""} onChange={(e) => set("lon", e.target.value)} placeholder="-94.20" />
+                <label>Lon (optional)</label>
+                <input value={form.lon ?? ""} onChange={(e) => set("lon", e.target.value)} />
               </div>
               <div className="field">
                 <label>Notes</label>
@@ -780,11 +926,7 @@ function Modal({ type, payload, contacts, onClose, onSaveDeal, onSaveContact, on
               </div>
               <div className="field">
                 <label>Account</label>
-                <select
-                  required
-                  value={form.contactId || ""}
-                  onChange={(e) => set("contactId", e.target.value)}
-                >
+                <select required value={form.contactId || ""} onChange={(e) => set("contactId", e.target.value)}>
                   <option value="">Select…</option>
                   {contacts.map((c) => (
                     <option key={c.id} value={c.id}>
@@ -816,7 +958,17 @@ function Modal({ type, payload, contacts, onClose, onSaveDeal, onSaveContact, on
             <button type="button" className="btn btn-ghost" onClick={onClose}>
               Cancel
             </button>
-            <button type="submit" className="btn btn-primary">
+            {type === "contact" && (
+              <button
+                type="button"
+                className="btn btn-ghost"
+                disabled={busy}
+                onClick={(e) => submit(e, true)}
+              >
+                {busy ? "…" : "Save + geocode"}
+              </button>
+            )}
+            <button type="submit" className="btn btn-primary" disabled={busy}>
               Save
             </button>
           </div>
