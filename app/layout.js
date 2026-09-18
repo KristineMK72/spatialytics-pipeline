@@ -23,7 +23,38 @@ export default function RootLayout({ children }) {
           crossOrigin=""
         />
       </head>
-      <body>{children}</body>
+      <body>
+        <div
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: "8px 16px",
+            padding: "8px 12px",
+            background: "rgba(7, 11, 18, 0.95)",
+            borderBottom: "1px solid rgba(148, 163, 184, 0.14)",
+            fontSize: "0.75rem",
+            color: "#94a3b8",
+          }}
+        >
+          <span style={{ fontWeight: 600, color: "#e8eef7" }}>Spatialytics family</span>
+          <a href="https://spatialytics-astro.vercel.app" style={{ color: "#38bdf8" }}>
+            Spatialytics
+          </a>
+          <span style={{ opacity: 0.4 }}>·</span>
+          <span style={{ color: "#38bdf8", fontWeight: 600 }}>Pipeline</span>
+          <span style={{ opacity: 0.4 }}>·</span>
+          <a href="https://shiftsprout.vercel.app" style={{ color: "#38bdf8" }}>
+            ShiftSprout
+          </a>
+          <span style={{ opacity: 0.4 }}>·</span>
+          <a href="https://spatialytics-astro.vercel.app/subscriptions" style={{ color: "#94a3b8" }}>
+            All tools
+          </a>
+        </div>
+        {children}
+      </body>
     </html>
   );
 }
